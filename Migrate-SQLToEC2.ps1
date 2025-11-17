@@ -11,11 +11,10 @@ $LinuxPassword = "YourLinuxPassword"      # CHANGE: Linux user password
 
 # SQL Server Configuration on Linux Server
 $SQLServerUser = "mssql"                  # SQL Server OS user on Linux
-$DatabaseName = "MyDatabase"              # CHANGE: Database name to backup (leave empty for all user databases)
+$DatabaseName = "MyDatabase"              # CHANGE: Database name to backup
 $SQLServerPort = "1433"                   # Default SQL Server port
 $SQLAuthUser = "sa"                       # SQL Server authentication user
 $SQLAuthPassword = "YourSQLPassword"      # CHANGE: SQL Server password
-$ExcludeSystemDBs = $true                 # Exclude system databases (model, master, tempdb, msdb)
 
 # NAS Mount Configuration on Linux Server
 $NASMountPath = "/mnt/nas/sql_backups"    # CHANGE: NAS mount path on Linux
