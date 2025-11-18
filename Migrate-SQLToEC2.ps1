@@ -2,22 +2,22 @@
 # CONFIGURATION SECTION
 # ============================================
 
-# Linux Server Configuration (where SQL Server is running)
-$LinuxHost = "192.168.1.100"              # CHANGE: Linux server IP/hostname
-$LinuxSSHPort = "22"                      # Default SSH port
-$LinuxUsername = "sqladmin"               # CHANGE: Linux user (can sudo to mssql)
-$LinuxPassword = "YourLinuxPassword"      # CHANGE: Linux user password
-# OR use SSH key: $LinuxSSHKeyPath = "C:\Users\YourUser\.ssh\id_rsa"
+# Windows Server Configuration (where SQL Server is running)
+$WindowsServerHost = "192.168.1.100"      # CHANGE: Windows server IP/hostname
+$WindowsServerUser = "Administrator"      # CHANGE: Windows server username
+$WindowsServerPassword = "YourPassword"   # CHANGE: Windows server password
+# Note: Ensure PowerShell Remoting is enabled on target server
 
-# SQL Server Configuration on Linux Server
-$SQLServerUser = "mssql"                  # SQL Server OS user on Linux
+# SQL Server Configuration on Windows Server
 $DatabaseName = "MyDatabase"              # CHANGE: Database name to backup
+$SQLServerInstance = "MSSQLSERVER"        # CHANGE: SQL Server instance (MSSQLSERVER for default)
 $SQLServerPort = "1433"                   # Default SQL Server port
 $SQLAuthUser = "sa"                       # SQL Server authentication user
 $SQLAuthPassword = "YourSQLPassword"      # CHANGE: SQL Server password
+$ExcludeSystemDBs = $true                 # Exclude system databases (model, master, tempdb, msdb)
 
-# NAS Mount Configuration on Linux Server
-$NASMountPath = "/mnt/nas/sql_backups"    # CHANGE: NAS mount path on Linux
+# NAS Mount Configuration on Windows Server
+$NASMountPath = "\\nas-server\sql_backups"  # CHANGE: UNC path to NAS share
 $BackupFileName = "SQLBackup.bak"         # Backup file name
 $LogFileName = "SQLBackup.log"            # Log file name
 
@@ -33,8 +33,8 @@ $S3BucketName = "your-sql-bucket"         # CHANGE: S3 bucket name
 $S3Region = "us-east-1"                   # CHANGE: S3 region
 $S3Folder = "sql-backups"                 # S3 folder prefix
 
-# Working Directory on Windows
-$WorkingDirectory = "C:\SQLMigration"     # Local working directory
+# Working Directory on Jump Box
+$WorkingDirectory = "C:\SQLMigration"     # Local working directory on jump box
 
 # Restore Configuration
 $TargetDatabaseName = "MyDatabase"        # Target database name on RDS
@@ -51,7 +51,7 @@ Clear-Host
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "                                                                " -ForegroundColor Cyan
-Write-Host "    SQL Server Migration: Linux Server to AWS RDS (via SSH)    " -ForegroundColor Cyan
+Write-Host "  SQL Server Migration: Windows Server to AWS RDS (via WinRM)  " -ForegroundColor Cyan
 Write-Host "                                                                " -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host ""
@@ -89,17 +89,13 @@ Set-Location $WorkingDirectory
 # Check prerequisites
 Write-SectionHeader "VERIFYING PREREQUISITES"
 
-# Check SSH client
-Write-Status "Checking SSH client..." "Info"
-$plinkAvailable = Get-Command plink -ErrorAction SilentlyContinue
-$sshAvailable = Get-Command ssh -ErrorAction SilentlyContinue
-
-if (-not $plinkAvailable -and -not $sshAvailable) {
-    Write-Status "No SSH client found! Please install OpenSSH or PuTTY" "Error"
-    Write-Host "  Install OpenSSH: Add-WindowsCapability -Online -Name OpenSSH.Client" -ForegroundColor Yellow
-    exit 1
+# Check SQL Server Module or sqlcmd
+Write-Status "Checking SQL Server tools..." "Info"
+$sqlcmdAvailable = Get-Command sqlcmd -ErrorAction SilentlyContinue
+if ($sqlcmdAvailable) {
+    Write-Status "sqlcmd found" "Success"
 } else {
-    Write-Status "SSH client found" "Success"
+    Write-Status "sqlcmd not found! Install SQL Server Command Line Utilities" "Warning"
 }
 
 # Check AWS CLI
@@ -123,216 +119,314 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 # ============================================
-# STEP 1: CONNECT TO LINUX SERVER & BACKUP
+# STEP 1: CONNECT TO WINDOWS SERVER & BACKUP
 # ============================================
-Write-SectionHeader "STEP 1: BACKUP FROM LINUX SQL SERVER"
+Write-SectionHeader "STEP 1: BACKUP FROM WINDOWS SQL SERVER"
 
-Write-Status "Connecting to Linux server: $LinuxHost" "Info"
+Write-Status "Connecting to Windows server: $WindowsServerHost" "Info"
 
-# Test SSH connection
-Write-Status "Testing SSH connection..." "Info"
-if ($sshAvailable) {
-    $testSSH = echo "exit" | ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$LinuxUsername@$LinuxHost" -p $LinuxSSHPort 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Status "SSH connection successful" "Success"
-    } else {
-        Write-Status "SSH connection failed!" "Error"
-        Write-Host "  Check: hostname, port, username, password/key" -ForegroundColor Yellow
-        exit 1
-    }
+# Create credentials for remote connection
+$securePassword = ConvertTo-SecureString $WindowsServerPassword -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential ($WindowsServerUser, $securePassword)
+
+# Test WinRM/PowerShell Remoting connection
+Write-Status "Testing PowerShell Remoting connection..." "Info"
+try {
+    $testConnection = Test-WSMan -ComputerName $WindowsServerHost -Credential $credential -ErrorAction Stop
+    Write-Status "PowerShell Remoting connection successful" "Success"
+} catch {
+    Write-Status "PowerShell Remoting failed! Ensure WinRM is enabled on target server." "Error"
+    Write-Host "  Enable WinRM: Run 'Enable-PSRemoting -Force' on $WindowsServerHost" -ForegroundColor Yellow
+    Write-Host "  Configure firewall: 'Set-NetFirewallRule -Name WINRM-HTTP-In-TCP -RemoteAddress Any'" -ForegroundColor Yellow
+    exit 1
 }
 
-# Create backup script for Linux
-$backupScript = @"
-#!/bin/bash
-# SQL Server Backup Script
+# Create backup script for Windows Server
+$backupScriptBlock = {
+    param(
+        $DatabaseName,
+        $SQLAuthUser,
+        $SQLAuthPassword,
+        $NASMountPath,
+        $BackupFileName,
+        $LogFileName,
+        $SQLServerInstance,
+        $SQLServerPort
+    )
+    
+    $ErrorActionPreference = "Continue"
+    $logFile = Join-Path $NASMountPath $LogFileName
+    $backupFile = Join-Path $NASMountPath $BackupFileName
+    
+    # Start logging
+    "================================" | Out-File $logFile
+    "SQL Server Database Backup" | Out-File $logFile -Append
+    "Started: $(Get-Date)" | Out-File $logFile -Append
+    "================================" | Out-File $logFile -Append
+    "" | Out-File $logFile -Append
+    
+    Write-Host "Verifying NAS mount path..." -ForegroundColor Cyan
+    if (-not (Test-Path $NASMountPath)) {
+        Write-Host "ERROR: NAS mount $NASMountPath not accessible!" -ForegroundColor Red
+        "ERROR: NAS mount not accessible" | Out-File $logFile -Append
+        return @{ Success = $false; Message = "NAS mount not accessible" }
+    }
+    Write-Host "NAS mount verified: $NASMountPath" -ForegroundColor Green
+    
+    # Verify SQL Server service
+    Write-Host "Checking SQL Server service..." -ForegroundColor Cyan
+    $serviceName = if ($SQLServerInstance -eq "MSSQLSERVER") { "MSSQLSERVER" } else { "MSSQL`$$SQLServerInstance" }
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    
+    if (-not $service) {
+        Write-Host "ERROR: SQL Server service not found!" -ForegroundColor Red
+        "ERROR: SQL Server service not found" | Out-File $logFile -Append
+        return @{ Success = $false; Message = "SQL Server service not found" }
+    }
+    
+    if ($service.Status -ne 'Running') {
+        Write-Host "ERROR: SQL Server service is not running!" -ForegroundColor Red
+        "ERROR: SQL Server service not running: $($service.Status)" | Out-File $logFile -Append
+        return @{ Success = $false; Message = "SQL Server not running" }
+    }
+    Write-Host "SQL Server service is running" -ForegroundColor Green
+    
+    # Build connection string
+    $serverInstance = if ($SQLServerInstance -eq "MSSQLSERVER") { 
+        "localhost,$SQLServerPort" 
+    } else { 
+        "localhost\$SQLServerInstance" 
+    }
+    
+    # Test SQL connection
+    Write-Host "Testing SQL Server connection..." -ForegroundColor Cyan
+    $testQuery = "SELECT @@VERSION AS Version;"
+    try {
+        $testResult = sqlcmd -S $serverInstance -U $SQLAuthUser -P $SQLAuthPassword -Q $testQuery -h -1 -W -C 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Cannot connect to SQL Server!" -ForegroundColor Red
+            "ERROR: Connection failed" | Out-File $logFile -Append
+            return @{ Success = $false; Message = "Cannot connect to SQL Server" }
+        }
+        Write-Host "SQL Server connection successful" -ForegroundColor Green
+    } catch {
+        Write-Host "ERROR: Connection test failed: $_" -ForegroundColor Red
+        "ERROR: $_" | Out-File $logFile -Append
+        return @{ Success = $false; Message = $_.Exception.Message }
+    }
+    
+    # List available user databases
+    Write-Host "" 
+    Write-Host "Available user databases:" -ForegroundColor Cyan
+    $userDBQuery = "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 AND name NOT IN ('model', 'master', 'tempdb', 'msdb') ORDER BY name;"
+    $userDatabases = sqlcmd -S $serverInstance -U $SQLAuthUser -P $SQLAuthPassword -Q $userDBQuery -h -1 -W -C 2>&1
+    Write-Host $userDatabases
+    "" | Out-File $logFile -Append
+    "User Databases:" | Out-File $logFile -Append
+    $userDatabases | Out-File $logFile -Append
+    
+    # Check if database exists and is not a system database
+    Write-Host ""
+    Write-Host "Validating database '$DatabaseName'..." -ForegroundColor Cyan
+    $dbCheckQuery = "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.databases WHERE name = '$DatabaseName' AND database_id > 4;"
+    $dbExists = sqlcmd -S $serverInstance -U $SQLAuthUser -P $SQLAuthPassword -Q $dbCheckQuery -h -1 -W -C 2>&1
+    
+    if ($dbExists.Trim() -eq "0") {
+        Write-Host "ERROR: Database '$DatabaseName' not found or is a system database!" -ForegroundColor Red
+        "ERROR: Database not found or is system database" | Out-File $logFile -Append
+        return @{ Success = $false; Message = "Database not found or is system database" }
+    }
+    Write-Host "Database '$DatabaseName' validated" -ForegroundColor Green
+    
+    # Perform backup
+    Write-Host ""
+    Write-Host "Starting SQL Server backup..." -ForegroundColor Cyan
+    Write-Host "Database: $DatabaseName" -ForegroundColor Gray
+    Write-Host "Backup file: $backupFile" -ForegroundColor Gray
+    Write-Host "This may take several minutes..." -ForegroundColor Yellow
+    Write-Host ""
+    
+    $backupQuery = @"
+SET NOCOUNT ON;
+DECLARE @BackupFile NVARCHAR(500) = N'$backupFile';
+DECLARE @DatabaseName NVARCHAR(128) = N'$DatabaseName';
 
-echo "=================================="
-echo "SQL Server Database Backup"
-echo "=================================="
+-- Check database state
+IF EXISTS (SELECT 1 FROM sys.databases WHERE name = @DatabaseName AND state_desc <> 'ONLINE')
+BEGIN
+    RAISERROR('Database is not ONLINE', 16, 1);
+END
 
-# Verify NAS mount
-echo "Checking NAS mount..."
-if [ ! -d "$NASMountPath" ]; then
-    echo "ERROR: NAS mount $NASMountPath not found!"
-    exit 1
-fi
-echo "NAS mount verified: $NASMountPath"
+-- Perform backup
+BACKUP DATABASE @DatabaseName 
+TO DISK = @BackupFile
+WITH 
+    NOFORMAT, 
+    INIT, 
+    NAME = N'Full Database Backup', 
+    SKIP, 
+    NOREWIND, 
+    NOUNLOAD, 
+    COMPRESSION, 
+    STATS = 10;
 
-# Set backup file path
-BACKUP_FILE="$NASMountPath/$BackupFileName"
-LOG_FILE="$NASMountPath/$LogFileName"
-
-echo ""
-echo "Starting SQL Server backup..."
-echo "Database: $DatabaseName"
-echo "Backup file: `$BACKUP_FILE"
-echo "This may take several minutes..."
-echo ""
-
-# Backup using sqlcmd
-/opt/mssql-tools/bin/sqlcmd -S localhost -U $SQLAuthUser -P '$SQLAuthPassword' -Q "BACKUP DATABASE [$DatabaseName] TO DISK = N'`$BACKUP_FILE' WITH NOFORMAT, NOINIT, NAME = N'$DatabaseName-Full Database Backup', SKIP, NOREWIND, NOUNLOAD, COMPRESSION, STATS = 10" > `$LOG_FILE 2>&1
-
-BACKUP_STATUS=`$?
-
-if [ `$BACKUP_STATUS -eq 0 ]; then
-    echo ""
-    echo "Backup completed successfully!"
-    ls -lh `$BACKUP_FILE
+PRINT 'Backup completed successfully';
+"@
+    
+    $backupResult = sqlcmd -S $serverInstance -U $SQLAuthUser -P $SQLAuthPassword -Q $backupQuery -C 2>&1
+    Write-Host $backupResult
+    $backupResult | Out-File $logFile -Append
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Backup failed!" -ForegroundColor Red
+        return @{ Success = $false; Message = "Backup failed" }
+    }
+    
+    Write-Host ""
+    Write-Host "Backup completed successfully!" -ForegroundColor Green
+    
+    # Get backup file info
+    if (Test-Path $backupFile) {
+        $fileInfo = Get-Item $backupFile
+        Write-Host "Backup file size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB" -ForegroundColor Gray
+        "Backup file size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB" | Out-File $logFile -Append
+    }
     
     # Verify backup
-    echo ""
-    echo "Verifying backup..."
-    /opt/mssql-tools/bin/sqlcmd -S localhost -U $SQLAuthUser -P '$SQLAuthPassword' -Q "RESTORE VERIFYONLY FROM DISK = N'`$BACKUP_FILE'" >> `$LOG_FILE 2>&1
-    
-    if [ `$? -eq 0 ]; then
-        echo "Backup verification successful!"
-    else
-        echo "WARNING: Backup verification failed!"
-        echo "Check log: `$LOG_FILE"
-    fi
-else
-    echo ""
-    echo "Backup failed with status: `$BACKUP_STATUS"
-    echo "Check log: `$LOG_FILE"
-    cat `$LOG_FILE
-    exit `$BACKUP_STATUS
-fi
-
-exit 0
-"@
-
-# Save backup script locally
-$localBackupScript = Join-Path $WorkingDirectory "backup_sql.sh"
-$backupScript | Out-File -FilePath $localBackupScript -Encoding ASCII -NoNewline
-
-Write-Status "Uploading backup script to Linux server..." "Info"
-
-# Copy script to Linux server
-if ($sshAvailable) {
-    # Use SCP to copy
-    & scp -P $LinuxSSHPort $localBackupScript "${LinuxUsername}@${LinuxHost}:/tmp/backup_sql.sh" 2>&1 | Out-Null
+    Write-Host ""
+    Write-Host "Verifying backup..." -ForegroundColor Cyan
+    $verifyQuery = "RESTORE VERIFYONLY FROM DISK = N'$backupFile';"
+    $verifyResult = sqlcmd -S $serverInstance -U $SQLAuthUser -P $SQLAuthPassword -Q $verifyQuery -C 2>&1
+    $verifyResult | Out-File $logFile -Append
     
     if ($LASTEXITCODE -eq 0) {
-        Write-Status "Script uploaded successfully" "Success"
+        Write-Host "Backup verification successful!" -ForegroundColor Green
+        "Backup verification: SUCCESS" | Out-File $logFile -Append
+        return @{ Success = $true; Message = "Backup completed and verified"; BackupFile = $backupFile }
     } else {
-        Write-Status "Failed to upload script" "Error"
-        exit 1
+        Write-Host "WARNING: Backup verification failed!" -ForegroundColor Yellow
+        "Backup verification: FAILED" | Out-File $logFile -Append
+        return @{ Success = $false; Message = "Backup verification failed" }
     }
 }
 
-Write-Status "Executing backup on Linux server..." "Info"
+# Execute backup on remote Windows server
+Write-Status "Executing backup on Windows server..." "Info"
 Write-Status "This will take several minutes. Please wait..." "Warning"
 Write-Host ""
 
-# Execute backup script on Linux
-$backupCommand = @"
-chmod +x /tmp/backup_sql.sh
-/tmp/backup_sql.sh
-"@
-
-if ($sshAvailable) {
-    $backupOutput = ssh -p $LinuxSSHPort "${LinuxUsername}@${LinuxHost}" $backupCommand 2>&1
-    Write-Host $backupOutput
+try {
+    $backupResult = Invoke-Command -ComputerName $WindowsServerHost -Credential $credential -ScriptBlock $backupScriptBlock -ArgumentList $DatabaseName, $SQLAuthUser, $SQLAuthPassword, $NASMountPath, $BackupFileName, $LogFileName, $SQLServerInstance, $SQLServerPort
     
-    if ($LASTEXITCODE -eq 0) {
-        Write-Status "Backup completed!" "Success"
+    if ($backupResult.Success) {
+        Write-Status "Backup completed successfully!" "Success"
     } else {
-        Write-Status "Backup may have warnings. Check output above." "Warning"
+        Write-Status "Backup failed: $($backupResult.Message)" "Error"
+        exit 1
     }
+} catch {
+    Write-Status "Error executing remote backup: $_" "Error"
+    exit 1
 }
 
 # Verify backup file exists on NAS
 Write-Status "Verifying backup file on NAS..." "Info"
-$verifyCommand = "ls -lh $NASMountPath/$BackupFileName 2>/dev/null"
-$fileInfo = ssh -p $LinuxSSHPort "${LinuxUsername}@${LinuxHost}" $verifyCommand 2>&1
+$nasBackupPath = Join-Path $NASMountPath $BackupFileName
 
-if ($LASTEXITCODE -eq 0) {
-    Write-Status "Backup file verified on NAS" "Success"
-    Write-Host "  $fileInfo" -ForegroundColor Gray
-} else {
-    Write-Status "Backup file not found on NAS!" "Error"
+try {
+    $fileCheck = Invoke-Command -ComputerName $WindowsServerHost -Credential $credential -ScriptBlock {
+        param($path)
+        if (Test-Path $path) {
+            $file = Get-Item $path
+            return @{ Exists = $true; Size = $file.Length; FullName = $file.FullName }
+        }
+        return @{ Exists = $false }
+    } -ArgumentList $nasBackupPath
+    
+    if ($fileCheck.Exists) {
+        Write-Status "Backup file verified on NAS" "Success"
+        Write-Host "  File: $($fileCheck.FullName)" -ForegroundColor Gray
+        Write-Host "  Size: $([math]::Round($fileCheck.Size / 1MB, 2)) MB" -ForegroundColor Gray
+    } else {
+        Write-Status "Backup file not found on NAS!" "Error"
+        exit 1
+    }
+} catch {
+    Write-Status "Error verifying backup file: $_" "Error"
     exit 1
 }
 
 # ============================================
-# STEP 2: UPLOAD TO S3 FROM LINUX SERVER
+# STEP 2: UPLOAD TO S3
 # ============================================
 Write-SectionHeader "STEP 2: UPLOAD TO AWS S3"
 
-Write-Status "Uploading backup file from Linux server to S3..." "Info"
-Write-Host "  Source: $NASMountPath/$BackupFileName" -ForegroundColor Gray
+Write-Status "Uploading backup file to S3..." "Info"
+Write-Host "  Source: $nasBackupPath" -ForegroundColor Gray
 Write-Host "  Destination: s3://$S3BucketName/$S3Folder/$BackupFileName" -ForegroundColor Gray
 Write-Host ""
 
-# Upload script for Linux
-$uploadScript = @"
-#!/bin/bash
-# Check if AWS CLI is installed
-if ! command -v aws &> /dev/null; then
-    echo "AWS CLI not found on Linux server"
-    echo "Attempting installation..."
-    # Try to install AWS CLI
-    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-    unzip -q /tmp/awscliv2.zip -d /tmp/
-    sudo /tmp/aws/install
-fi
+# Try to upload from Windows server first
+Write-Status "Attempting upload from Windows server..." "Info"
 
-# Upload to S3
-echo "Uploading to S3..."
-aws s3 cp $NASMountPath/$BackupFileName s3://$S3BucketName/$S3Folder/$BackupFileName --region $S3Region
-
-if [ `$? -eq 0 ]; then
-    echo "Upload successful"
-    # Verify
-    aws s3 ls s3://$S3BucketName/$S3Folder/$BackupFileName --region $S3Region
-    exit 0
-else
-    echo "Upload failed"
-    exit 1
-fi
-"@
-
-$localUploadScript = Join-Path $WorkingDirectory "upload_s3.sh"
-$uploadScript | Out-File -FilePath $localUploadScript -Encoding ASCII -NoNewline
-
-# Copy and execute upload script
-scp -P $LinuxSSHPort $localUploadScript "${LinuxUsername}@${LinuxHost}:/tmp/upload_s3.sh" 2>&1 | Out-Null
-
-$uploadCommand = @"
-chmod +x /tmp/upload_s3.sh
-/tmp/upload_s3.sh
-"@
-
-$uploadOutput = ssh -p $LinuxSSHPort "${LinuxUsername}@${LinuxHost}" $uploadCommand 2>&1
-Write-Host $uploadOutput
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Status "S3 upload completed!" "Success"
-} else {
-    Write-Status "S3 upload from Linux failed. Trying from Windows..." "Warning"
+$uploadScriptBlock = {
+    param($NASMountPath, $BackupFileName, $S3BucketName, $S3Folder, $S3Region)
     
-    # Fallback: Download to Windows then upload
-    Write-Status "Downloading backup file to Windows..." "Info"
-    $localBackupFile = Join-Path $WorkingDirectory $BackupFileName
-    scp -P $LinuxSSHPort "${LinuxUsername}@${LinuxHost}:$NASMountPath/$BackupFileName" $localBackupFile 2>&1 | Out-Null
+    $backupFile = Join-Path $NASMountPath $BackupFileName
+    
+    # Check if AWS CLI is installed
+    $awsCLI = Get-Command aws -ErrorAction SilentlyContinue
+    if (-not $awsCLI) {
+        return @{ Success = $false; Message = "AWS CLI not installed on Windows server" }
+    }
+    
+    # Upload to S3
+    $uploadResult = & aws s3 cp $backupFile "s3://$S3BucketName/$S3Folder/$BackupFileName" --region $S3Region 2>&1
     
     if ($LASTEXITCODE -eq 0) {
-        Write-Status "Download to Windows successful" "Success"
+        # Verify upload
+        $verifyResult = & aws s3 ls "s3://$S3BucketName/$S3Folder/$BackupFileName" --region $S3Region 2>&1
+        return @{ Success = $true; Message = "Upload successful"; Output = $verifyResult }
+    } else {
+        return @{ Success = $false; Message = "Upload failed"; Output = $uploadResult }
+    }
+}
+
+try {
+    $uploadResult = Invoke-Command -ComputerName $WindowsServerHost -Credential $credential -ScriptBlock $uploadScriptBlock -ArgumentList $NASMountPath, $BackupFileName, $S3BucketName, $S3Folder, $S3Region
+    
+    if ($uploadResult.Success) {
+        Write-Status "S3 upload completed from Windows server!" "Success"
+        Write-Host $uploadResult.Output
+    } else {
+        Write-Status "Upload from Windows server failed: $($uploadResult.Message)" "Warning"
         
-        Write-Status "Uploading from Windows to S3..." "Info"
-        & aws s3 cp $localBackupFile "s3://$S3BucketName/$S3Folder/$BackupFileName" --region $S3Region 2>&1
+        # Fallback: Copy to jump box then upload
+        Write-Status "Downloading backup file to jump box..." "Info"
+        $localBackupFile = Join-Path $WorkingDirectory $BackupFileName
         
-        if ($LASTEXITCODE -eq 0) {
-            Write-Status "S3 upload completed!" "Success"
+        Copy-Item -Path $nasBackupPath -Destination $localBackupFile -FromSession (New-PSSession -ComputerName $WindowsServerHost -Credential $credential) -ErrorAction Stop
+        
+        if (Test-Path $localBackupFile) {
+            Write-Status "Download to jump box successful" "Success"
+            
+            Write-Status "Uploading from jump box to S3..." "Info"
+            & aws s3 cp $localBackupFile "s3://$S3BucketName/$S3Folder/$BackupFileName" --region $S3Region 2>&1
+            
+            if ($LASTEXITCODE -eq 0) {
+                Write-Status "S3 upload completed from jump box!" "Success"
+            } else {
+                Write-Status "S3 upload failed!" "Error"
+                exit 1
+            }
         } else {
-            Write-Status "S3 upload failed!" "Error"
+            Write-Status "Download to jump box failed!" "Error"
             exit 1
         }
-    } else {
-        Write-Status "Download failed!" "Error"
-        exit 1
     }
+} catch {
+    Write-Status "Error during upload process: $_" "Error"
+    exit 1
 }
 
 # ============================================
@@ -343,12 +437,14 @@ Write-SectionHeader "STEP 3: RESTORE TO AWS RDS FROM S3"
 Write-Status "Connecting to RDS..." "Info"
 Write-Host "  Endpoint: $RDSEndpoint" -ForegroundColor Gray
 
-# Test RDS connection (if sqlcmd available on Windows)
-$sqlcmdAvailable = Get-Command sqlcmd -ErrorAction SilentlyContinue
+# Test RDS connection (if sqlcmd available on jump box)
 if ($sqlcmdAvailable) {
-    $testRDS = "SELECT 'Connected' AS Status;" | sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -h -1 -W 2>&1
+    Write-Status "Testing RDS connection..." "Info"
+    $testRDS = "SELECT 'Connected' AS Status;" | sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -h -1 -W -C 2>&1
     if ($testRDS -match "Connected") {
         Write-Status "RDS connection successful" "Success"
+    } else {
+        Write-Status "RDS connection test inconclusive, continuing..." "Warning"
     }
 }
 
@@ -364,9 +460,6 @@ USE [master];
 GO
 
 -- Step 1: Download backup from S3 to RDS
--- Note: This uses native backup/restore through S3 integration
--- Ensure RDS has S3 integration option group configured
-
 PRINT 'Downloading backup from S3 to RDS...'
 PRINT 'S3 Location: s3://$S3BucketName/$S3Folder/$BackupFileName'
 PRINT ''
@@ -440,7 +533,7 @@ if ($sqlcmdAvailable) {
     Write-Host "Executing restore script on RDS..." -ForegroundColor Cyan
     Write-Host ""
     
-    sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -i $restoreSQLFile
+    sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -i $restoreSQLFile -C
     
     if ($LASTEXITCODE -eq 0) {
         Write-Status "RDS restore initiated!" "Success"
@@ -452,7 +545,7 @@ if ($sqlcmdAvailable) {
         Write-Status "Restore completed with warnings" "Warning"
     }
 } else {
-    Write-Status "SQLCmd not available on Windows" "Warning"
+    Write-Status "SQLCmd not available on jump box" "Warning"
     Write-Host ""
     Write-Host "  MANUAL STEP REQUIRED:" -ForegroundColor Yellow
     Write-Host "  Connect to RDS and run the SQL script:" -ForegroundColor Yellow
@@ -516,7 +609,7 @@ if ($sqlcmdAvailable) {
         Start-Sleep -Seconds 30
         $waitCount++
         
-        $statusCheck = "SELECT lifecycle FROM msdb.dbo.rds_fn_task_status(NULL, 0) WHERE task_type = 'RESTORE_DB' ORDER BY created_at DESC;" | sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -h -1 -W 2>&1
+        $statusCheck = "SELECT lifecycle FROM msdb.dbo.rds_fn_task_status(NULL, 0) WHERE task_type = 'RESTORE_DB' ORDER BY created_at DESC;" | sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -h -1 -W -C 2>&1
         
         if ($statusCheck -match "SUCCESS") {
             Write-Status "Restore completed successfully!" "Success"
@@ -536,7 +629,7 @@ if ($sqlcmdAvailable) {
     Write-Host ""
     Write-Host "Verification Results:" -ForegroundColor Cyan
     Write-Host ""
-    $verifySQL | sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master
+    $verifySQL | sqlcmd -S "$RDSEndpoint,$RDSPort" -U $RDSUsername -P $RDSPassword -d master -C
 }
 
 # ============================================
@@ -555,9 +648,18 @@ Write-SectionHeader "CLEANUP"
 
 $cleanup = Read-Host "Delete files on NAS? (Y/N) [Default: N]"
 if ($cleanup -eq 'Y' -or $cleanup -eq 'y') {
-    $cleanupCmd = "rm -f $NASMountPath/$BackupFileName $NASMountPath/$LogFileName"
-    ssh -p $LinuxSSHPort "${LinuxUsername}@${LinuxHost}" $cleanupCmd 2>&1 | Out-Null
-    Write-Status "NAS files cleaned" "Success"
+    try {
+        Invoke-Command -ComputerName $WindowsServerHost -Credential $credential -ScriptBlock {
+            param($NASMountPath, $BackupFileName, $LogFileName)
+            $backupFile = Join-Path $NASMountPath $BackupFileName
+            $logFile = Join-Path $NASMountPath $LogFileName
+            Remove-Item -Path $backupFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $logFile -Force -ErrorAction SilentlyContinue
+        } -ArgumentList $NASMountPath, $BackupFileName, $LogFileName
+        Write-Status "NAS files cleaned" "Success"
+    } catch {
+        Write-Status "Error cleaning NAS files: $_" "Warning"
+    }
 }
 
 $s3cleanup = Read-Host "Delete S3 files? (Y/N) [Default: N]"
