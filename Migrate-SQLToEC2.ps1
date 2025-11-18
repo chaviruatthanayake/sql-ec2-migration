@@ -21,12 +21,14 @@ $NASMountPath = "\\nas-server\sql_backups"  # CHANGE: UNC path to NAS share
 $BackupFileName = "SQLBackup.bak"         # Backup file name
 $LogFileName = "SQLBackup.log"            # Log file name
 
-# AWS RDS SQL Server Configuration
-$RDSEndpoint = "mydb.abc123.us-east-1.rds.amazonaws.com"  # CHANGE: RDS endpoint
-$RDSPort = "1433"
-$RDSDatabaseName = "MyDatabase"           # CHANGE: RDS database name
-$RDSUsername = "admin"                    # CHANGE: RDS master username
-$RDSPassword = "YourRDSPassword"          # CHANGE: RDS password
+# AWS EC2 SQL Server Configuration
+$EC2SQLServerHost = "ec2-sql-server.compute.amazonaws.com"  # CHANGE: EC2 instance IP/hostname
+$EC2SQLServerPort = "1433"                # Default SQL Server port
+$EC2SQLServerInstance = "MSSQLSERVER"     # SQL Server instance (MSSQLSERVER for default)
+$EC2SQLAuthUser = "sa"                    # SQL Server authentication user
+$EC2SQLAuthPassword = "YourEC2SQLPassword"  # CHANGE: SQL Server password on EC2
+$EC2WindowsUser = "Administrator"         # CHANGE: EC2 Windows username (for file operations)
+$EC2WindowsPassword = "YourEC2WinPassword"  # CHANGE: EC2 Windows password
 
 # AWS S3 Configuration
 $S3BucketName = "your-sql-bucket"         # CHANGE: S3 bucket name
